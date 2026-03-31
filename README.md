@@ -1,6 +1,31 @@
-# 🛡️ Phishing Detection System
+# 🛡️ AI-Based Phishing Detection System
 
 A hybrid phishing detection system using Machine Learning, HTML analysis, and threat intelligence APIs.
+
+---
+
+## 🧱 Architecture
+
+```
+User → Streamlit UI → FastAPI → ML Model
+                             → HTML Scraper
+                             → VirusTotal API
+                             → AbuseIPDB API
+                             → Decision Engine → Score + Label + Reasons
+```
+
+---
+
+## 📦 Tech Stack
+
+| Layer | Technology |
+|---|---|
+| UI | Streamlit |
+| API | FastAPI |
+| ML | XGBoost + scikit-learn |
+| Scraping | BeautifulSoup |
+| Threat Intel | VirusTotal, AbuseIPDB |
+| Deployment | Railway |
 
 ---
 
@@ -34,80 +59,75 @@ uvicorn api.main:app --reload
 
 ### 6. Start the UI (new terminal)
 ```bash
-streamlit run ui/app.py
+python -m streamlit run ui/app.py
 ```
 
 ---
 
-## ☁️ Deploy to Render
+## ☁️ Deploy to Railway
 
-1. Push this repo to GitHub
-2. Go to https://render.com → New → Blueprint
-3. Connect your GitHub repo (it will detect `render.yaml`)
-4. Add environment variables in Render dashboard:
-   - `VIRUSTOTAL_API_KEY`
-   - `ABUSEIPDB_API_KEY`
-   - `API_URL` → set to your deployed FastAPI service URL
-5. Deploy both services
+### Deploy API
+1. Go to https://railway.app → Login with GitHub
+2. Click **New Project** → **Deploy from GitHub repo**
+3. Select `phishing-detection` repo
+4. Go to **Variables** tab and add:
+   - `VIRUSTOTAL_API_KEY` → your key
+   - `ABUSEIPDB_API_KEY` → your key
+5. Go to **Settings** → **Domains** → **Generate Domain**
+6. Copy your API URL (e.g. `https://phishing-detection.up.railway.app`)
+
+### Deploy UI
+1. Click **New Service** in the same Railway project
+2. Select the same GitHub repo
+3. Go to **Settings** → **Start Command** and set:
+   ```
+   python -m streamlit run ui/app.py --server.port $PORT --server.address 0.0.0.0
+   ```
+4. Go to **Variables** tab and add:
+   - `API_URL` → your Railway API URL from above
+5. Go to **Settings** → **Domains** → **Generate Domain**
 
 > ⚠️ Make sure `ml_model/phishing_model.pkl` is committed to the repo before deploying (train locally first).
 
 ---
 
-## 🤖 n8n Automation
+## 🔑 Environment Variables
 
-### What it does
-- Exposes a webhook (`POST /check-url`) that n8n listens on
-- n8n calls your FastAPI `/webhook` with the URL
-- Routes result by label: **phishing → log alert + Slack**, **suspicious → Slack warning**
-- All alerts are stored via `POST /alert` and viewable at `GET /alerts`
-
-### Setup
-1. Install & start n8n:
-```bash
-npx n8n
-```
-2. Open http://localhost:5678 → **Import workflow** → select `n8n/phishing_detection_workflow.json`
-3. In the Slack nodes, add your Slack credential and set the target channel
-4. Activate the workflow — your n8n webhook URL will be:
-```
-http://localhost:5678/webhook/check-url
-```
-5. Test it:
-```bash
-curl -X POST http://localhost:5678/webhook/check-url \
-  -H "Content-Type: application/json" \
-  -d '{"url": "http://suspicious-site.com"}'
-```
-
-### New API Endpoints
-| Method | Endpoint | Description |
+| Variable | Service | Description |
 |---|---|---|
-| GET/POST | `/webhook?url=` | n8n-friendly predict endpoint |
-| POST | `/alert` | Receive alert from n8n |
-| GET | `/alerts` | View all logged alerts |
+| `VIRUSTOTAL_API_KEY` | API | VirusTotal API key |
+| `ABUSEIPDB_API_KEY` | API | AbuseIPDB API key |
+| `API_URL` | UI | Deployed FastAPI URL |
 
 ---
 
-## 🧱 Architecture
+## 📊 Example Output
 
-```
-User → Streamlit UI → FastAPI → ML Model
-                             → HTML Scraper
-                             → VirusTotal API
-                             → AbuseIPDB API
-                             → Decision Engine → Score + Label + Reasons
+```json
+{
+  "score": 95,
+  "label": "phishing",
+  "reasons": [
+    "ML model flagged as phishing (99.9% confidence)",
+    "VirusTotal: 5 engines flagged as malicious",
+    "Login form with password field detected"
+  ]
+}
 ```
 
 ---
 
-## 📦 Tech Stack
+## ⚠️ Limitations
 
-| Layer | Technology |
-|---|---|
-| UI | Streamlit |
-| API | FastAPI |
-| ML | XGBoost + scikit-learn |
-| Scraping | BeautifulSoup |
-| Threat Intel | VirusTotal, AbuseIPDB |
-| Deployment | Render |
+- Depends on external APIs (VirusTotal, AbuseIPDB)
+- Cannot detect highly obfuscated attacks
+- Some features (domain age, page rank) default to 0 without paid APIs
+
+---
+
+## 🔮 Future Scope
+
+- Deep learning-based URL analysis
+- Browser extension for real-time protection
+- Email security system integration
+- Image-based phishing detection
