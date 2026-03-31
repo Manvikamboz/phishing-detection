@@ -1,4 +1,4 @@
-# 🛡️ AI-Based Phishing Detection System
+# 🛡️ Phishing Detection System
 
 A hybrid phishing detection system using Machine Learning, HTML analysis, and threat intelligence APIs.
 
