@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+ml_model/dataset.csv
+.venv/
+venv/

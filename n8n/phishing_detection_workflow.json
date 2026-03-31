@@ -1,0 +1,161 @@
+{
+  "name": "Phishing Detection Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "check-url",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "n8n-webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "phishing-check"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/webhook",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "url", "value": "={{ $json.body.url }}" }
+          ]
+        },
+        "options": { "timeout": 30000 }
+      },
+      "id": "n8n-http-predict",
+      "name": "Call Phishing API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.label }}",
+              "operation": "equals",
+              "value2": "phishing"
+            }
+          ]
+        }
+      },
+      "id": "n8n-if-phishing",
+      "name": "Is Phishing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.label }}",
+              "operation": "equals",
+              "value2": "suspicious"
+            }
+          ]
+        }
+      },
+      "id": "n8n-if-suspicious",
+      "name": "Is Suspicious?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 480]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/alert",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "url",     "value": "={{ $json.url }}" },
+            { "name": "label",   "value": "={{ $json.label }}" },
+            { "name": "score",   "value": "={{ $json.score }}" },
+            { "name": "reasons", "value": "={{ $json.reasons }}" },
+            { "name": "source",  "value": "n8n" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n8n-log-alert",
+      "name": "Log Alert to API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "text": "🚨 *PHISHING DETECTED*\n*URL:* {{ $json.url }}\n*Score:* {{ $json.score }}/100\n*Reasons:*\n{{ $json.reasons.join('\\n') }}",
+        "otherOptions": {}
+      },
+      "id": "n8n-slack-phishing",
+      "name": "Slack Alert (Phishing)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1120, 220],
+      "notes": "Configure your Slack credential and channel in node settings"
+    },
+    {
+      "parameters": {
+        "text": "⚠️ *SUSPICIOUS URL*\n*URL:* {{ $json.url }}\n*Score:* {{ $json.score }}/100\n*Reasons:*\n{{ $json.reasons.join('\\n') }}",
+        "otherOptions": {}
+      },
+      "id": "n8n-slack-suspicious",
+      "name": "Slack Alert (Suspicious)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1120, 480],
+      "notes": "Configure your Slack credential and channel in node settings"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "n8n-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 520]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [[{ "node": "Call Phishing API", "type": "main", "index": 0 }]]
+    },
+    "Call Phishing API": {
+      "main": [
+        [
+          { "node": "Is Phishing?",   "type": "main", "index": 0 },
+          { "node": "Is Suspicious?", "type": "main", "index": 0 },
+          { "node": "Respond to Webhook", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Is Phishing?": {
+      "main": [
+        [{ "node": "Log Alert to API",      "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Is Suspicious?": {
+      "main": [
+        [{ "node": "Slack Alert (Suspicious)", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Log Alert to API": {
+      "main": [[{ "node": "Slack Alert (Phishing)", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["phishing", "security", "automation"]
+}

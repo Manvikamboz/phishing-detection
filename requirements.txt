@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+streamlit
+scikit-learn
+xgboost
+pandas
+numpy
+requests
+beautifulsoup4
+python-dotenv
+joblib
+lxml
+httpx
+plotly
