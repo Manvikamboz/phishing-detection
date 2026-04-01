@@ -66,26 +66,28 @@ python -m streamlit run ui/app.py
 
 ## ☁️ Deploy to Railway
 
-### Deploy API
+> ⚠️ You need **two separate Railway services** from the same GitHub repo — one for the API, one for the UI.
+
+### Step 1 — Deploy the API service
 1. Go to https://railway.app → Login with GitHub
-2. Click **New Project** → **Deploy from GitHub repo**
-3. Select `phishing-detection` repo
+2. Click **New Project** → **Deploy from GitHub repo** → select your repo
+3. Railway will auto-detect `railway.json` and use: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
 4. Go to **Variables** tab and add:
    - `VIRUSTOTAL_API_KEY` → your key
    - `ABUSEIPDB_API_KEY` → your key
-5. Go to **Settings** → **Domains** → **Generate Domain**
-6. Copy your API URL (e.g. `https://phishing-detection.up.railway.app`)
+   - `IPSTACK_API_KEY` → your key
+5. Go to **Settings** → **Networking** → **Generate Domain**
+6. Copy the API URL (e.g. `https://your-api.up.railway.app`)
 
-### Deploy UI
-1. Click **New Service** in the same Railway project
-2. Select the same GitHub repo
-3. Go to **Settings** → **Start Command** and set:
+### Step 2 — Deploy the UI service
+1. In the **same Railway project**, click **+ New** → **GitHub Repo** → select the same repo
+2. Go to **Settings** → **Deploy** → **Custom Start Command** and set:
    ```
    python -m streamlit run ui/app.py --server.port $PORT --server.address 0.0.0.0
    ```
-4. Go to **Variables** tab and add:
-   - `API_URL` → your Railway API URL from above
-5. Go to **Settings** → **Domains** → **Generate Domain**
+3. Go to **Variables** tab and add:
+   - `API_URL` → the API URL from Step 1 (e.g. `https://your-api.up.railway.app`)
+4. Go to **Settings** → **Networking** → **Generate Domain**
 
 > ⚠️ Make sure `ml_model/phishing_model.pkl` is committed to the repo before deploying (train locally first).
 
