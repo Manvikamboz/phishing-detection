@@ -1,281 +1,264 @@
 import re
+import math
+from urllib.parse import urlparse
 
-# Known brands for impersonation detection
 _BRANDS = re.compile(r"paypal|ebay|amazon|google|microsoft|apple|facebook|instagram|twitter|netflix|bank|chase|wellsfargo|citibank|hsbc|barclays", re.I)
 _SUSPICIOUS_TLDS = re.compile(r"\.(tk|ml|ga|cf|gq|xyz|top|club|online|site|info|biz|work|click|link|live|stream|download)$", re.I)
 _SHORTENERS = re.compile(r"bit\.ly|goo\.gl|tinyurl|ow\.ly|t\.co|is\.gd|buff\.ly|adf\.ly|shorte\.st|cutt\.ly|rb\.gy", re.I)
 
+# ── Bayesian fusion ───────────────────────────────────────────────────────────
+# Each source emits a likelihood ratio (LR): how much more likely is phishing
+# given this evidence vs. not. Prior = 0.5 (balanced dataset).
+# Posterior = sigmoid(log-prior + sum(log(LR_i)))
+# Sources are treated as conditionally independent given the class.
 
-# ── individual scorers ────────────────────────────────────────────────────────
+_LOG_PRIOR = math.log(0.5 / 0.5)  # 0 — balanced prior
 
-def _score_ml(ml: dict) -> tuple[int, list[str], bool]:
-    """Returns (score, reasons, is_hard_phishing).
-    is_hard_phishing=True triggers an override regardless of total score."""
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _lr_to_log(lr: float) -> float:
+    """Convert likelihood ratio to log-odds contribution. Clipped for stability."""
+    lr = max(lr, 1e-6)
+    return math.log(lr)
+
+
+# ── Source evidence extractors ────────────────────────────────────────────────
+
+def _evidence_ml(ml: dict) -> tuple[float, list[str], bool]:
+    """Returns (log_odds_contribution, reasons, hard_override)."""
     label = ml.get("label", "")
     conf  = ml.get("confidence", 0)
     if label == "phishing":
         if conf >= 90:
-            return 40, [f"ML model: HIGH confidence phishing ({conf:.1f}%)"], True
+            return _lr_to_log(18.0), [f"ML model: HIGH confidence phishing ({conf:.1f}%)"], True
         if conf >= 70:
-            return 32, [f"ML model flagged as phishing ({conf:.1f}% confidence)"], False
-        return 18, [f"ML model flagged as phishing ({conf:.1f}% confidence)"], False
-    # Even if label=legitimate, penalise low confidence (model is unsure)
+            return _lr_to_log(9.0),  [f"ML model flagged as phishing ({conf:.1f}%)"], False
+        return _lr_to_log(4.0),      [f"ML model flagged as phishing ({conf:.1f}%)"], False
     if label == "legitimate" and conf < 60:
-        return 8, [f"ML model uncertain — low legitimate confidence ({conf:.1f}%)"], False
-    return 0, [], False
+        return _lr_to_log(1.8),      [f"ML model uncertain ({conf:.1f}% legitimate confidence)"], False
+    # Strong legitimate signal — negative contribution
+    return _lr_to_log(0.15),         [], False
 
 
-def _score_virustotal(vt: dict) -> tuple[int, list[str], bool]:
+def _evidence_virustotal(vt: dict) -> tuple[float, list[str], bool]:
     malicious  = vt.get("malicious", 0)
     suspicious = vt.get("suspicious", 0)
     total      = malicious + suspicious + vt.get("harmless", 0) + vt.get("undetected", 0)
     if malicious >= 3:
-        ratio = malicious / total if total else 0
-        score = min(35, max(malicious * 4, int(ratio * 60)))
-        return score, [f"VirusTotal: {malicious}/{total} engines flagged malicious"], True
+        lr = min(50.0, malicious * 6.0)
+        return _lr_to_log(lr), [f"VirusTotal: {malicious}/{total} engines flagged malicious"], True
     if malicious > 0:
-        return 20, [f"VirusTotal: {malicious}/{total} engines flagged malicious"], False
+        return _lr_to_log(8.0),  [f"VirusTotal: {malicious}/{total} engines flagged malicious"], False
     if suspicious >= 3:
-        return 14, [f"VirusTotal: {suspicious} engines flagged suspicious"], False
+        return _lr_to_log(4.0),  [f"VirusTotal: {suspicious} engines flagged suspicious"], False
     if suspicious > 0:
-        return 7, [f"VirusTotal: {suspicious} engines flagged suspicious"], False
-    return 0, [], False
+        return _lr_to_log(2.0),  [f"VirusTotal: {suspicious} engines flagged suspicious"], False
+    # Clean VT result — negative contribution
+    return _lr_to_log(0.3), [], False
 
 
-def _score_abuseipdb(abuse: dict) -> tuple[int, list[str]]:
-    s         = abuse.get("abuse_score", 0)
-    reports   = abuse.get("total_reports", 0)
-    is_tor    = abuse.get("is_tor", False)
-    cdn_masked= abuse.get("cdn_masked", False)
-    isp       = abuse.get("isp", "")
-
-    score, reasons = 0, []
+def _evidence_abuseipdb(abuse: dict) -> tuple[float, list[str]]:
+    s        = abuse.get("abuse_score", 0)
+    reports  = abuse.get("total_reports", 0)
+    is_tor   = abuse.get("is_tor", False)
+    cdn      = abuse.get("cdn_masked", False)
+    isp      = abuse.get("isp", "")
+    log_odds, reasons = 0.0, []
 
     if is_tor:
-        score += 10
+        log_odds += _lr_to_log(4.0)
         reasons.append("AbuseIPDB: IP is a TOR exit node")
     if s > 75 or reports > 10:
-        score += 12
+        log_odds += _lr_to_log(5.0)
         reasons.append(f"AbuseIPDB: high abuse score {s}% ({reports} reports)")
     elif s > 50:
-        score += 8
+        log_odds += _lr_to_log(3.0)
         reasons.append(f"AbuseIPDB: abuse score {s}%")
     elif s > 20:
-        score += 4
+        log_odds += _lr_to_log(1.8)
         reasons.append(f"AbuseIPDB: moderate abuse score {s}%")
-    if cdn_masked and score == 0:
-        # Don't penalise but inform — CDN masks real IP
+    if cdn and log_odds == 0.0:
         reasons.append(f"AbuseIPDB: IP behind CDN ({isp}) — score may be unreliable")
+    return log_odds, reasons
 
-    return min(score, 15), reasons
 
-
-def _score_ipstack(ip: dict) -> tuple[int, list[str]]:
+def _evidence_ipstack(ip: dict) -> tuple[float, list[str]]:
     if not ip or ip.get("error"):
-        return 0, []
+        return 0.0, []
     if ip.get("is_attacker"):
-        return 13, ["IPStack: IP flagged as attacker"]
+        return _lr_to_log(6.0), ["IPStack: IP flagged as attacker"]
     if ip.get("is_tor") or ip.get("is_proxy"):
-        return 9,  ["IPStack: IP is TOR node or proxy"]
+        return _lr_to_log(3.5), ["IPStack: IP is TOR node or proxy"]
     if ip.get("is_anonymous"):
-        return 5,  ["IPStack: IP is anonymous"]
-    return 0, []
+        return _lr_to_log(2.0), ["IPStack: IP is anonymous"]
+    return 0.0, []
 
 
-def _score_html(html: dict) -> tuple[int, list[str]]:
-    score, reasons = 0, []
+def _evidence_html(html: dict) -> tuple[float, list[str]]:
+    log_odds, reasons = 0.0, []
     if html.get("has_login_form") and html.get("has_password_field"):
-        score += 5
+        log_odds += _lr_to_log(2.5)
         reasons.append("Login form with password field detected")
     if html.get("form_action_empty"):
-        score += 4
+        log_odds += _lr_to_log(2.0)
         reasons.append("Form with empty/null action attribute")
     if html.get("iframe_count", 0) > 2:
-        score += 3
+        log_odds += _lr_to_log(1.8)
         reasons.append(f"Multiple hidden iframes ({html['iframe_count']})")
     if html.get("external_script_count", 0) > 10:
-        score += 3
+        log_odds += _lr_to_log(1.6)
         reasons.append(f"High external script count ({html['external_script_count']})")
     if html.get("hidden_element_count", 0) > 3:
-        score += 2
+        log_odds += _lr_to_log(1.4)
         reasons.append(f"Hidden elements detected ({html['hidden_element_count']})")
-    return min(score, 15), reasons
+    return log_odds, reasons
 
 
-def _score_url_heuristics(url: str) -> tuple[int, list[str]]:
-    score, reasons = 0, []
+def _evidence_url(url: str) -> tuple[float, list[str]]:
     if not url:
-        return 0, []
+        return 0.0, []
+    log_odds, reasons = 0.0, []
     url_lower = url.lower()
-    from urllib.parse import urlparse
-    parsed   = urlparse(url)
-    hostname = (parsed.hostname or "").lower()
-    path     = (parsed.path or "").lower()
-    parts    = hostname.split(".")
-    tld      = parts[-1] if parts else ""
-
-    # Brand name in subdomain but not as the real domain (typosquatting)
+    parsed    = urlparse(url)
+    hostname  = (parsed.hostname or "").lower()
+    path      = (parsed.path or "").lower()
+    parts     = hostname.split(".")
+    tld       = parts[-1] if parts else ""
     subdomain = ".".join(parts[:-2]) if len(parts) > 2 else ""
+
     if _BRANDS.search(subdomain):
-        score += 20
-        reasons.append(f"Brand name '{_BRANDS.search(subdomain).group()}' found in subdomain (typosquatting)")
+        log_odds += _lr_to_log(25.0)
+        reasons.append(f"Brand '{_BRANDS.search(subdomain).group()}' in subdomain (typosquatting)")
 
-    # Brand name in path (e.g. paypal.com.evil.com/paypal-login)
     if _BRANDS.search(path):
-        score += 10
-        reasons.append(f"Brand name in URL path — possible impersonation")
+        log_odds += _lr_to_log(5.0)
+        reasons.append("Brand name in URL path — possible impersonation")
 
-    # Brand name in domain itself with action keywords (netflix-billing, amazon-update)
-    brand_in_domain = _BRANDS.search(hostname)
-    action_keywords = re.search(r"billing|update|verify|secure|login|signin|account|confirm|suspend|locked|alert|support", hostname)
-    if brand_in_domain and action_keywords:
-        score += 22
-        reasons.append(f"Brand '{brand_in_domain.group()}' + action keyword '{action_keywords.group()}' in domain — high-confidence phishing pattern")
+    brand_m  = _BRANDS.search(hostname)
+    action_m = re.search(r"billing|update|verify|secure|login|signin|account|confirm|suspend|locked|alert|support", hostname)
+    if brand_m and action_m:
+        log_odds += _lr_to_log(30.0)
+        reasons.append(f"Brand '{brand_m.group()}' + action keyword '{action_m.group()}' in domain")
 
-    # Suspicious TLD
     if _SUSPICIOUS_TLDS.search(hostname):
-        score += 8
+        log_odds += _lr_to_log(3.5)
         reasons.append(f"Suspicious TLD (.{tld}) commonly used in phishing")
 
-    # URL shortener — hides real destination
     if _SHORTENERS.search(url_lower):
-        score += 12
+        log_odds += _lr_to_log(5.0)
         reasons.append("URL shortener detected — real destination hidden")
 
-    # IP address as hostname
     if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname):
-        score += 15
+        log_odds += _lr_to_log(8.0)
         reasons.append("IP address used as hostname instead of domain name")
 
-    # Punycode / homograph attack (xn--)
     if "xn--" in hostname:
-        score += 18
+        log_odds += _lr_to_log(12.0)
         reasons.append("Punycode/homograph domain detected — visual spoofing attack")
 
-    # @ symbol in URL (tricks browser into ignoring real host)
     if "@" in url:
-        score += 15
+        log_odds += _lr_to_log(8.0)
         reasons.append("@ symbol in URL — browser ignores everything before it")
 
-    # Multiple subdomains (e.g. secure.login.verify.evil.com)
     nb_sub = max(len(parts) - 2, 0)
     if nb_sub >= 4:
-        score += 12
+        log_odds += _lr_to_log(5.0)
         reasons.append(f"Excessive subdomains ({nb_sub}) — common evasion technique")
     elif nb_sub == 3:
-        score += 5
+        log_odds += _lr_to_log(2.0)
         reasons.append(f"Multiple subdomains ({nb_sub})")
 
-    # Hyphen in domain (e.g. paypal-secure-login.com)
     if hostname.count("-") >= 2:
-        score += 8
+        log_odds += _lr_to_log(3.0)
         reasons.append(f"Multiple hyphens in domain ({hostname.count('-')}) — evasion pattern")
 
-    # HTTP (not HTTPS) with login-related path
     if parsed.scheme == "http" and re.search(r"login|signin|account|verify|secure|password", path):
-        score += 12
+        log_odds += _lr_to_log(5.0)
         reasons.append("HTTP (not HTTPS) used on a login/sensitive page")
 
-    # Very long URL (obfuscation)
     if len(url) > 150:
-        score += 6
+        log_odds += _lr_to_log(2.2)
         reasons.append(f"Unusually long URL ({len(url)} chars) — possible obfuscation")
 
-    # Digits in domain (e.g. paypa1.com, amaz0n.com)
-    if re.search(r"[0-9]", hostname.split(".")[0] if parts else ""):
-        score += 7
+    if re.search(r"[0-9]", parts[0] if parts else ""):
+        log_odds += _lr_to_log(2.5)
         reasons.append("Digits in domain name — possible character substitution attack")
 
-    return min(score, 40), reasons
+    return log_odds, reasons
 
 
-# ── multi-signal correlation ──────────────────────────────────────────────────
-
-def _correlate(ml_score, vt_score, abuse_score, ip_score, html_score, url_score) -> tuple[int, list[str]]:
-    """
-    If multiple independent sources agree → amplify score.
-    This catches smart phishing that scores low on each individual source.
-    """
-    positive_sources = sum([
-        ml_score >= 15,
-        vt_score >= 7,
-        abuse_score >= 4,
-        ip_score >= 5,
-        html_score >= 5,
-        url_score >= 8,
-    ])
-    if positive_sources >= 4:
-        return 20, [f"Multi-source correlation: {positive_sources}/6 independent sources flagged this URL"]
-    if positive_sources == 3:
-        return 10, [f"Multi-source correlation: {positive_sources}/6 sources raised concerns"]
-    if positive_sources == 2:
-        return 5,  [f"Multi-source correlation: {positive_sources}/6 sources raised concerns"]
-    return 0, []
-
-
-# ── main decide function ──────────────────────────────────────────────────────
+# ── Main decide function ──────────────────────────────────────────────────────
 
 def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
            html_features: dict, ipstack_result: dict = None) -> dict:
 
-    ml_score,    ml_reasons,    ml_hard    = _score_ml(ml_result)
-    vt_score,    vt_reasons,    vt_hard    = _score_virustotal(vt_result)
-    abuse_score, abuse_reasons             = _score_abuseipdb(abuse_result)
-    ip_score,    ip_reasons                = _score_ipstack(ipstack_result or {})
-    html_score,  html_reasons              = _score_html(html_features)
-    url_score,   url_reasons               = _score_url_heuristics(ml_result.get("url", ""))
-    corr_bonus,  corr_reasons              = _correlate(ml_score, vt_score, abuse_score, ip_score, html_score, url_score)
+    ml_log,    ml_reasons,  ml_hard  = _evidence_ml(ml_result)
+    vt_log,    vt_reasons,  vt_hard  = _evidence_virustotal(vt_result)
+    abuse_log, abuse_reasons         = _evidence_abuseipdb(abuse_result)
+    ip_log,    ip_reasons            = _evidence_ipstack(ipstack_result or {})
+    html_log,  html_reasons          = _evidence_html(html_features)
+    url_log,   url_reasons           = _evidence_url(ml_result.get("url", ""))
 
-    total = min(
-        ml_score + vt_score + abuse_score + ip_score + html_score + url_score + corr_bonus,
-        100
+    # Weighted fusion: ML and VT are most reliable, URL heuristics next
+    weights = {"ml": 1.4, "vt": 1.3, "abuse": 0.9, "ip": 0.8, "html": 0.9, "url": 1.1}
+    total_log_odds = (
+        _LOG_PRIOR
+        + weights["ml"]    * ml_log
+        + weights["vt"]    * vt_log
+        + weights["abuse"] * abuse_log
+        + weights["ip"]    * ip_log
+        + weights["html"]  * html_log
+        + weights["url"]   * url_log
     )
 
-    all_reasons = ml_reasons + vt_reasons + abuse_reasons + ip_reasons + html_reasons + url_reasons + corr_reasons
+    # Convert posterior probability → 0-100 score
+    posterior = _sigmoid(total_log_odds)
+    score = int(round(posterior * 100))
+
+    all_reasons = ml_reasons + vt_reasons + abuse_reasons + ip_reasons + html_reasons + url_reasons
 
     # ── Hard override rules ───────────────────────────────────────────────────
-    # These force phishing label regardless of total score
     override_reason = None
-
     if ml_hard and vt_hard:
         override_reason = "OVERRIDE: Both ML model and VirusTotal independently confirmed phishing"
-
-    elif ml_hard and url_score >= 15:
+    elif ml_hard and url_log > _lr_to_log(5.0):
         override_reason = "OVERRIDE: ML high-confidence phishing + strong URL heuristic signals"
-
-    elif vt_hard and url_score >= 15:
+    elif vt_hard and url_log > _lr_to_log(5.0):
         override_reason = "OVERRIDE: VirusTotal confirmed malicious + strong URL heuristic signals"
-
-    elif vt_score >= 20 and abuse_score >= 8:
+    elif vt_log > _lr_to_log(8.0) and abuse_log > _lr_to_log(3.0):
         override_reason = "OVERRIDE: VirusTotal malicious + high IP abuse score"
-
-    elif url_score >= 30:
-        # URL alone has extremely strong phishing signals (e.g. punycode + brand impersonation)
+    elif url_log > _lr_to_log(20.0):
         override_reason = "OVERRIDE: Extreme URL-level phishing signals detected"
 
     if override_reason:
-        total = max(total, 85)
+        score = max(score, 85)
         all_reasons.insert(0, f"🚨 {override_reason}")
 
     # ── Final label ───────────────────────────────────────────────────────────
-    if total >= 65:
+    if score >= 65:
         label = "phishing"
-    elif total >= 35:
+    elif score >= 35:
         label = "suspicious"
     else:
         label = "benign"
 
+    # Per-source scores mapped back to 0-100 for UI display
+    def _log_to_display(log_val: float) -> int:
+        return min(100, max(0, int(round(_sigmoid(log_val) * 100))))
+
     return {
-        "score": total,
+        "score": score,
         "label": label,
         "reasons": all_reasons or ["No significant threats detected"],
         "source_scores": {
-            "ML Model":       ml_score,
-            "VirusTotal":     vt_score,
-            "AbuseIPDB":      abuse_score,
-            "IPStack":        ip_score,
-            "HTML Analysis":  html_score,
-            "URL Heuristics": url_score,
-            "Correlation":    corr_bonus,
+            "ML Model":       _log_to_display(ml_log * weights["ml"]),
+            "VirusTotal":     _log_to_display(vt_log * weights["vt"]),
+            "AbuseIPDB":      _log_to_display(abuse_log * weights["abuse"]),
+            "IPStack":        _log_to_display(ip_log * weights["ip"]),
+            "HTML Analysis":  _log_to_display(html_log * weights["html"]),
+            "URL Heuristics": _log_to_display(url_log * weights["url"]),
         },
     }

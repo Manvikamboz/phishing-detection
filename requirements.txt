@@ -3,6 +3,8 @@ uvicorn[standard]
 streamlit
 scikit-learn
 xgboost
+lightgbm
+imbalanced-learn
 pandas
 numpy
 requests

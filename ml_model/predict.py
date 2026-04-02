@@ -1,6 +1,7 @@
 import joblib
 import numpy as np
 import re
+import math
 import socket
 import requests
 from urllib.parse import urlparse
@@ -14,11 +15,71 @@ PHISH_HINTS = r"login|verify|secure|account|update|banking|confirm|password|sign
 SUSPICIOUS_TLDS = r"\.(tk|ml|ga|cf|gq|xyz|top|club|online|site|info|biz)$"
 BRANDS = r"paypal|ebay|amazon|google|microsoft|apple|facebook|instagram|twitter|netflix|bank"
 
+_KNOWN_BRANDS = [
+    "paypal", "ebay", "amazon", "google", "microsoft", "apple",
+    "facebook", "instagram", "twitter", "netflix", "bank", "chase",
+    "wellsfargo", "citibank", "hsbc", "barclays",
+]
+
 
 def _load():
     if "model" not in _cache:
         _cache.update(joblib.load(MODEL_PATH))
     return _cache
+
+
+# ── New feature helpers ───────────────────────────────────────────────────────
+
+def _entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    freq = {c: s.count(c) / len(s) for c in set(s)}
+    return -sum(p * math.log2(p) for p in freq.values())
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
+def _min_brand_distance(hostname: str) -> int:
+    parts = hostname.split(".")
+    sld = parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+    return min(_levenshtein(sld, brand) for brand in _KNOWN_BRANDS)
+
+
+def _consonant_ratio(s: str) -> float:
+    letters = [c for c in s.lower() if c.isalpha()]
+    if not letters:
+        return 0.0
+    return len([c for c in letters if c not in "aeiou"]) / len(letters)
+
+
+def _add_engineered_features(features: dict) -> dict:
+    """Mirror the engineered features added during training."""
+    length_url = features.get("length_url", 1)
+    special = (features.get("nb_at", 0) + features.get("nb_percent", 0)
+               + features.get("nb_tilde", 0) + features.get("nb_dollar", 0))
+    features["ratio_special_chars"] = special / max(length_url, 1)
+    features["subdomain_hyphen"]    = features.get("nb_subdomains", 0) * features.get("nb_hyphens", 0)
+    features["ext_link_dominance"]  = features.get("ratio_extHyperlinks", 0) - features.get("ratio_intHyperlinks", 0)
+    features["null_login_combo"]    = features.get("ratio_nullHyperlinks", 0) * features.get("login_form", 0)
+    features["obfuscation_score"]   = (
+        features.get("punycode", 0) * 3
+        + features.get("shortening_service", 0) * 2
+        + features.get("http_in_path", 0)
+        + features.get("https_token", 0)
+    )
+    return features
 
 
 def extract_url_features(url: str) -> dict:
@@ -29,124 +90,85 @@ def extract_url_features(url: str) -> dict:
     full = url.lower()
     hostname_lower = hostname.lower()
 
-    # digit ratios
-    digits_url = sum(c.isdigit() for c in url)
+    digits_url  = sum(c.isdigit() for c in url)
     digits_host = sum(c.isdigit() for c in hostname)
 
-    # words
-    words_raw = re.split(r"[\W_]+", full)
-    words_raw = [w for w in words_raw if w]
-    words_host = re.split(r"[\W_]+", hostname_lower)
-    words_host = [w for w in words_host if w]
-    words_path = re.split(r"[\W_]+", path.lower())
-    words_path = [w for w in words_path if w]
+    words_raw  = [w for w in re.split(r"[\W_]+", full) if w]
+    words_host = [w for w in re.split(r"[\W_]+", hostname_lower) if w]
+    words_path = [w for w in re.split(r"[\W_]+", path.lower()) if w]
 
-    # subdomains
     parts = hostname_lower.split(".")
     nb_subdomains = max(len(parts) - 2, 0)
-
-    # tld
     tld = parts[-1] if parts else ""
 
-    # char repeat: max consecutive repeated chars
     char_repeat = max((len(list(g)) for _, g in __import__("itertools").groupby(full)), default=0)
 
-    # try to get page features via HTTP
-    html_text = ""
-    nb_hyperlinks = 0
-    ratio_intHyperlinks = 0.0
-    ratio_extHyperlinks = 0.0
-    ratio_nullHyperlinks = 0.0
-    nb_extCSS = 0
-    ratio_intRedirection = 0.0
-    ratio_extRedirection = 0.0
-    ratio_intErrors = 0.0
-    ratio_extErrors = 0.0
-    login_form = 0
-    external_favicon = 0
-    links_in_tags = 0.0
-    submit_email = 0
-    ratio_intMedia = 0.0
-    ratio_extMedia = 0.0
-    sfh = 0
-    iframe = 0
-    popup_window = 0
-    safe_anchor = 0.0
-    onmouseover = 0
-    right_clic = 0
+    # HTML features (best-effort)
+    nb_hyperlinks = nb_extCSS = login_form = sfh = submit_email = 0
+    iframe = popup_window = onmouseover = right_clic = external_favicon = 0
     empty_title = 1
-    domain_in_title = 0
-    domain_with_copyright = 0
+    domain_in_title = domain_with_copyright = 0
+    ratio_intHyperlinks = ratio_extHyperlinks = ratio_nullHyperlinks = 0.0
+    ratio_intRedirection = ratio_extRedirection = 0.0
+    ratio_intErrors = ratio_extErrors = 0.0
+    ratio_intMedia = ratio_extMedia = links_in_tags = safe_anchor = 0.0
+    nb_redirection = 0
 
     try:
         resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
         html_text = resp.text
         soup = BeautifulSoup(html_text, "lxml")
 
-        # hyperlinks
         anchors = soup.find_all("a", href=True)
         nb_hyperlinks = len(anchors)
         if nb_hyperlinks:
-            int_links = sum(1 for a in anchors if hostname_lower in (a["href"] or ""))
+            int_links  = sum(1 for a in anchors if hostname_lower in (a["href"] or ""))
             null_links = sum(1 for a in anchors if (a["href"] or "").strip() in ("", "#", "javascript:void(0)"))
-            ext_links = nb_hyperlinks - int_links - null_links
-            ratio_intHyperlinks = int_links / nb_hyperlinks
-            ratio_extHyperlinks = ext_links / nb_hyperlinks
+            ext_links  = nb_hyperlinks - int_links - null_links
+            ratio_intHyperlinks  = int_links / nb_hyperlinks
+            ratio_extHyperlinks  = ext_links / nb_hyperlinks
             ratio_nullHyperlinks = null_links / nb_hyperlinks
+            safe_anchor = int_links / nb_hyperlinks
 
-        # CSS
-        nb_extCSS = len([l for l in soup.find_all("link", rel="stylesheet") if hostname_lower not in (l.get("href") or "")])
+        nb_extCSS = len([l for l in soup.find_all("link", rel="stylesheet")
+                         if hostname_lower not in (l.get("href") or "")])
 
-        # login form
         forms = soup.find_all("form")
-        login_form = int(bool(soup.find("input", {"type": "password"})))
-        sfh = int(any(f.get("action", "").strip() in ("", "#") for f in forms))
-        submit_email = int(any("mailto:" in (f.get("action", "") or "") for f in forms))
+        login_form    = int(bool(soup.find("input", {"type": "password"})))
+        sfh           = int(any(f.get("action", "").strip() in ("", "#") for f in forms))
+        submit_email  = int(any("mailto:" in (f.get("action", "") or "") for f in forms))
 
-        # iframe
-        iframe = int(bool(soup.find("iframe")))
-        popup_window = int("window.open" in html_text)
-        onmouseover = int("onmouseover" in html_text.lower())
-        right_clic = int("event.button==2" in html_text or "contextmenu" in html_text.lower())
+        iframe        = int(bool(soup.find("iframe")))
+        popup_window  = int("window.open" in html_text)
+        onmouseover   = int("onmouseover" in html_text.lower())
+        right_clic    = int("event.button==2" in html_text or "contextmenu" in html_text.lower())
 
-        # favicon
         favicon = soup.find("link", rel=lambda r: r and "icon" in r)
         external_favicon = int(bool(favicon and favicon.get("href") and hostname_lower not in favicon["href"]))
 
-        # title
-        title_tag = soup.find("title")
-        title_text = title_tag.get_text().lower() if title_tag else ""
+        title_tag   = soup.find("title")
+        title_text  = title_tag.get_text().lower() if title_tag else ""
         empty_title = int(not title_text.strip())
         domain_in_title = int(parts[0] in title_text if parts else False)
-
-        # copyright
         domain_with_copyright = int(bool(re.search(r"©|copyright", html_text, re.I)) and hostname_lower in html_text.lower())
 
-        # media
         media_tags = soup.find_all(["img", "video", "audio"])
         if media_tags:
             int_media = sum(1 for m in media_tags if hostname_lower in (m.get("src") or ""))
             ratio_intMedia = int_media / len(media_tags)
             ratio_extMedia = 1 - ratio_intMedia
 
-        # links in tags
         tag_links = soup.find_all(["meta", "script", "link"])
         if tag_links:
-            int_tag = sum(1 for t in tag_links if hostname_lower in (t.get("href") or t.get("src") or t.get("content") or ""))
+            int_tag = sum(1 for t in tag_links
+                          if hostname_lower in (t.get("href") or t.get("src") or t.get("content") or ""))
             links_in_tags = int_tag / len(tag_links)
 
-        # safe anchor
-        if nb_hyperlinks:
-            safe = sum(1 for a in anchors if hostname_lower in (a["href"] or ""))
-            safe_anchor = safe / nb_hyperlinks
-
-        # redirections
         nb_redirection = len(resp.history)
 
     except Exception:
         pass
 
-    # DNS / WHOIS approximations
     dns_record = 0
     try:
         socket.gethostbyname(hostname)
@@ -154,7 +176,14 @@ def extract_url_features(url: str) -> dict:
     except Exception:
         pass
 
-    return {
+    # ── New features ──────────────────────────────────────────────────────────
+    url_entropy      = _entropy(url)
+    hostname_entropy = _entropy(hostname)
+    min_brand_dist   = _min_brand_distance(hostname)
+    sld = parts[0] if parts else hostname
+    consonant_ratio  = _consonant_ratio(sld)
+
+    features = {
         "length_url": len(url),
         "length_hostname": len(hostname),
         "ip": int(bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname))),
@@ -192,7 +221,7 @@ def extract_url_features(url: str) -> dict:
         "random_domain": int(bool(re.search(r"[0-9]{4,}", hostname_lower))),
         "shortening_service": int(bool(re.search(SHORTENING_SERVICES, full))),
         "path_extension": int(bool(re.search(r"\.(php|html|htm|asp|aspx|jsp)$", path.lower()))),
-        "nb_redirection": locals().get("nb_redirection", 0),
+        "nb_redirection": nb_redirection,
         "nb_external_redirection": 0,
         "length_words_raw": len(words_raw),
         "char_repeat": char_repeat,
@@ -242,20 +271,31 @@ def extract_url_features(url: str) -> dict:
         "dns_record": dns_record,
         "google_index": 0,
         "page_rank": 0,
+        # New features
+        "url_entropy":        url_entropy,
+        "hostname_entropy":   hostname_entropy,
+        "min_brand_distance": min_brand_dist,
+        "consonant_ratio":    consonant_ratio,
     }
+    return _add_engineered_features(features)
 
 
 def predict(url: str) -> dict:
     bundle = _load()
-    model = bundle["model"]
+    model        = bundle["model"]
     feature_cols = bundle["features"]
-    le = bundle["label_encoder"]
+    le           = bundle["label_encoder"]
 
     features = extract_url_features(url)
-    row = np.array([[features.get(f, 0) for f in feature_cols]])
-    proba = model.predict_proba(row)[0]
+    row      = np.array([[features.get(f, 0) for f in feature_cols]])
+    proba    = model.predict_proba(row)[0]
     pred_idx = int(np.argmax(proba))
-    label = le.inverse_transform([pred_idx])[0]
+    label    = le.inverse_transform([pred_idx])[0]
     confidence = round(float(proba[pred_idx]) * 100, 2)
 
-    return {"url": url, "label": label, "confidence": confidence, "probabilities": dict(zip(le.classes_, proba.tolist()))}
+    return {
+        "url": url,
+        "label": label,
+        "confidence": confidence,
+        "probabilities": dict(zip(le.classes_, proba.tolist())),
+    }
