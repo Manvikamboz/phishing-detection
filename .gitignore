@@ -4,3 +4,4 @@ __pycache__/
 ml_model/dataset.csv
 .venv/
 venv/
+*.pkl
