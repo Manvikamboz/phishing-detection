@@ -2,6 +2,15 @@ import re
 import math
 from urllib.parse import urlparse
 
+# Well-known legitimate domains — skip heuristic penalties for these
+_TRUSTED_DOMAINS = {
+    "github.com", "google.com", "microsoft.com", "apple.com",
+    "amazon.com", "youtube.com", "linkedin.com", "stackoverflow.com",
+    "wikipedia.org", "reddit.com", "twitter.com", "x.com",
+    "facebook.com", "instagram.com", "netflix.com", "adobe.com",
+    "cloudflare.com", "aws.amazon.com",
+}
+
 _BRANDS = re.compile(r"paypal|ebay|amazon|google|microsoft|apple|facebook|instagram|twitter|netflix|bank|chase|wellsfargo|citibank|hsbc|barclays", re.I)
 _SUSPICIOUS_TLDS = re.compile(r"\.(tk|ml|ga|cf|gq|xyz|top|club|online|site|info|biz|work|click|link|live|stream|download)$", re.I)
 _SHORTENERS = re.compile(r"bit\.ly|goo\.gl|tinyurl|ow\.ly|t\.co|is\.gd|buff\.ly|adf\.ly|shorte\.st|cutt\.ly|rb\.gy", re.I)
@@ -117,9 +126,65 @@ def _evidence_html(html: dict) -> tuple[float, list[str]]:
     return log_odds, reasons
 
 
+def _evidence_ipqs(ipqs: dict) -> tuple[float, list[str]]:
+    if not ipqs or ipqs.get("error"):
+        return 0.0, []
+    log_odds, reasons = 0.0, []
+    score = ipqs.get("fraud_score", 0)
+    if ipqs.get("phishing"):
+        log_odds += _lr_to_log(20.0)
+        reasons.append(f"IPQualityScore: URL flagged as phishing (fraud score {score})")
+    elif ipqs.get("malware"):
+        log_odds += _lr_to_log(15.0)
+        reasons.append(f"IPQualityScore: URL flagged as malware (fraud score {score})")
+    elif ipqs.get("suspicious") or score >= 75:
+        log_odds += _lr_to_log(6.0)
+        reasons.append(f"IPQualityScore: suspicious URL (fraud score {score})")
+    elif score >= 50:
+        log_odds += _lr_to_log(3.0)
+        reasons.append(f"IPQualityScore: moderate risk (fraud score {score})")
+    elif score < 20:
+        log_odds += _lr_to_log(0.2)  # clean signal
+    if ipqs.get("is_proxy") or ipqs.get("is_vpn"):
+        log_odds += _lr_to_log(2.5)
+        reasons.append("IPQualityScore: traffic routed through proxy/VPN")
+    return log_odds, reasons
+
+
+def _evidence_fetchserp(fs: dict) -> tuple[float, list[str]]:
+    """Domain age and google index as legitimacy signals."""
+    if not fs or fs.get("error"):
+        return 0.0, []
+    log_odds, reasons = 0.0, []
+    age_days = fs.get("domain_age_days", -1)
+    if age_days >= 0:
+        if age_days < 30:
+            log_odds += _lr_to_log(6.0)
+            reasons.append(f"Domain is very new ({age_days} days old) — high phishing risk")
+        elif age_days < 180:
+            log_odds += _lr_to_log(2.5)
+            reasons.append(f"Domain is relatively new ({age_days} days old)")
+        else:
+            log_odds += _lr_to_log(0.2)  # old domain = legitimate signal
+    if fs.get("google_index") == 0 and age_days >= 0:
+        log_odds += _lr_to_log(2.0)
+        reasons.append("Domain not indexed by Google")
+    elif fs.get("google_index") == 1:
+        log_odds += _lr_to_log(0.3)  # indexed = legitimate signal
+    return log_odds, reasons
+
+
+
+def _is_trusted(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower()
+    return any(hostname == d or hostname.endswith("." + d) for d in _TRUSTED_DOMAINS)
+
+
 def _evidence_url(url: str) -> tuple[float, list[str]]:
     if not url:
         return 0.0, []
+    if _is_trusted(url):
+        return _lr_to_log(0.05), []  # strong legitimate signal for trusted domains
     log_odds, reasons = 0.0, []
     url_lower = url.lower()
     parsed    = urlparse(url)
@@ -193,45 +258,60 @@ def _evidence_url(url: str) -> tuple[float, list[str]]:
 # ── Main decide function ──────────────────────────────────────────────────────
 
 def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
-           html_features: dict, ipstack_result: dict = None) -> dict:
+           html_features: dict, ipstack_result: dict = None,
+           ipqs_result: dict = None, fetchserp_result: dict = None) -> dict:
+
+    url = ml_result.get("url", "")
+    trusted = _is_trusted(url)
 
     ml_log,    ml_reasons,  ml_hard  = _evidence_ml(ml_result)
     vt_log,    vt_reasons,  vt_hard  = _evidence_virustotal(vt_result)
     abuse_log, abuse_reasons         = _evidence_abuseipdb(abuse_result)
     ip_log,    ip_reasons            = _evidence_ipstack(ipstack_result or {})
     html_log,  html_reasons          = _evidence_html(html_features)
-    url_log,   url_reasons           = _evidence_url(ml_result.get("url", ""))
+    url_log,   url_reasons           = _evidence_url(url)
+    ipqs_log,  ipqs_reasons          = _evidence_ipqs(ipqs_result or {})
+    fs_log,    fs_reasons            = _evidence_fetchserp(fetchserp_result or {})
 
-    # Weighted fusion: ML and VT are most reliable, URL heuristics next
-    weights = {"ml": 1.4, "vt": 1.3, "abuse": 0.9, "ip": 0.8, "html": 0.9, "url": 1.1}
+    if trusted:
+        ml_log   = min(ml_log, _lr_to_log(1.0))
+        html_log = min(html_log, _lr_to_log(1.0))
+        ml_hard  = False
+
+    weights = {"ml": 1.4, "vt": 1.3, "abuse": 0.9, "ip": 0.8,
+               "html": 0.9, "url": 1.1, "ipqs": 1.4, "fetchserp": 1.2}
     total_log_odds = (
         _LOG_PRIOR
-        + weights["ml"]    * ml_log
-        + weights["vt"]    * vt_log
-        + weights["abuse"] * abuse_log
-        + weights["ip"]    * ip_log
-        + weights["html"]  * html_log
-        + weights["url"]   * url_log
+        + weights["ml"]       * ml_log
+        + weights["vt"]       * vt_log
+        + weights["abuse"]    * abuse_log
+        + weights["ip"]       * ip_log
+        + weights["html"]     * html_log
+        + weights["url"]      * url_log
+        + weights["ipqs"]     * ipqs_log
+        + weights["fetchserp"]* fs_log
     )
 
     # Convert posterior probability → 0-100 score
     posterior = _sigmoid(total_log_odds)
     score = int(round(posterior * 100))
 
-    all_reasons = ml_reasons + vt_reasons + abuse_reasons + ip_reasons + html_reasons + url_reasons
+    all_reasons = (ml_reasons + vt_reasons + abuse_reasons + ip_reasons
+                   + html_reasons + url_reasons + ipqs_reasons + fs_reasons)
 
-    # ── Hard override rules ───────────────────────────────────────────────────
+    # ── Hard override rules (skipped for trusted domains) ──────────────────
     override_reason = None
-    if ml_hard and vt_hard:
-        override_reason = "OVERRIDE: Both ML model and VirusTotal independently confirmed phishing"
-    elif ml_hard and url_log > _lr_to_log(5.0):
-        override_reason = "OVERRIDE: ML high-confidence phishing + strong URL heuristic signals"
-    elif vt_hard and url_log > _lr_to_log(5.0):
-        override_reason = "OVERRIDE: VirusTotal confirmed malicious + strong URL heuristic signals"
-    elif vt_log > _lr_to_log(8.0) and abuse_log > _lr_to_log(3.0):
-        override_reason = "OVERRIDE: VirusTotal malicious + high IP abuse score"
-    elif url_log > _lr_to_log(20.0):
-        override_reason = "OVERRIDE: Extreme URL-level phishing signals detected"
+    if not trusted:
+        if ml_hard and vt_hard:
+            override_reason = "OVERRIDE: Both ML model and VirusTotal independently confirmed phishing"
+        elif ml_hard and url_log > _lr_to_log(5.0):
+            override_reason = "OVERRIDE: ML high-confidence phishing + strong URL heuristic signals"
+        elif vt_hard and url_log > _lr_to_log(5.0):
+            override_reason = "OVERRIDE: VirusTotal confirmed malicious + strong URL heuristic signals"
+        elif vt_log > _lr_to_log(8.0) and abuse_log > _lr_to_log(3.0):
+            override_reason = "OVERRIDE: VirusTotal malicious + high IP abuse score"
+        elif url_log > _lr_to_log(20.0):
+            override_reason = "OVERRIDE: Extreme URL-level phishing signals detected"
 
     if override_reason:
         score = max(score, 85)
@@ -254,11 +334,13 @@ def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
         "label": label,
         "reasons": all_reasons or ["No significant threats detected"],
         "source_scores": {
-            "ML Model":       _log_to_display(ml_log * weights["ml"]),
-            "VirusTotal":     _log_to_display(vt_log * weights["vt"]),
-            "AbuseIPDB":      _log_to_display(abuse_log * weights["abuse"]),
-            "IPStack":        _log_to_display(ip_log * weights["ip"]),
-            "HTML Analysis":  _log_to_display(html_log * weights["html"]),
-            "URL Heuristics": _log_to_display(url_log * weights["url"]),
+            "ML Model":         _log_to_display(ml_log * weights["ml"]),
+            "VirusTotal":       _log_to_display(vt_log * weights["vt"]),
+            "AbuseIPDB":        _log_to_display(abuse_log * weights["abuse"]),
+            "IPStack":          _log_to_display(ip_log * weights["ip"]),
+            "HTML Analysis":    _log_to_display(html_log * weights["html"]),
+            "URL Heuristics":   _log_to_display(url_log * weights["url"]),
+            "IPQualityScore":   _log_to_display(ipqs_log * weights["ipqs"]),
+            "FetchSERP":        _log_to_display(fs_log * weights["fetchserp"]),
         },
     }

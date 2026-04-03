@@ -1,5 +1,7 @@
 import joblib
+import warnings
 import numpy as np
+import pandas as pd
 import re
 import math
 import socket
@@ -7,7 +9,10 @@ import requests
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
-MODEL_PATH = "ml_model/phishing_model.pkl"
+MODEL_PATHS = [
+    "ml_model/phishing_model.pkl",    # trained on dataset 1 (Kaggle web-page phishing)
+    "ml_model/phishing_model_2.pkl",  # trained on dataset 2 (second Kaggle dataset)
+]
 _cache = {}
 
 SHORTENING_SERVICES = r"bit\.ly|goo\.gl|tinyurl|ow\.ly|t\.co|is\.gd|buff\.ly|adf\.ly|shorte\.st"
@@ -23,9 +28,17 @@ _KNOWN_BRANDS = [
 
 
 def _load():
-    if "model" not in _cache:
-        _cache.update(joblib.load(MODEL_PATH))
-    return _cache
+    if "models" not in _cache:
+        loaded = []
+        for path in MODEL_PATHS:
+            try:
+                loaded.append(joblib.load(path))
+            except FileNotFoundError:
+                pass  # second model optional — only use if trained
+        if not loaded:
+            raise FileNotFoundError("No trained model found. Run ml_model/train.py first.")
+        _cache["models"] = loaded
+    return _cache["models"]
 
 
 # ── New feature helpers ───────────────────────────────────────────────────────
@@ -265,7 +278,7 @@ def extract_url_features(url: str) -> dict:
         "domain_in_title": domain_in_title,
         "domain_with_copyright": domain_with_copyright,
         "whois_registered_domain": dns_record,
-        "domain_registration_length": 0,
+        "domain_registration_length": 0,  # filled by enrich_features() if FetchSERP key set
         "domain_age": 0,
         "web_traffic": 0,
         "dns_record": dns_record,
@@ -280,22 +293,59 @@ def extract_url_features(url: str) -> dict:
     return _add_engineered_features(features)
 
 
-def predict(url: str) -> dict:
-    bundle = _load()
-    model        = bundle["model"]
-    feature_cols = bundle["features"]
-    le           = bundle["label_encoder"]
+def enrich_features(features: dict, fetchserp: dict = None, ipqs: dict = None) -> dict:
+    """Overwrite the hardcoded-zero domain features with real API values."""
+    if fetchserp and not fetchserp.get("error"):
+        age_days = fetchserp.get("domain_age_days", -1)
+        if age_days >= 0:
+            features["domain_age"]                = age_days
+            features["domain_registration_length"] = age_days
+        features["google_index"] = fetchserp.get("google_index", 0)
+        features["page_rank"]    = fetchserp.get("page_rank", 0)
+    if ipqs and not ipqs.get("error"):
+        age_days = ipqs.get("domain_age_days", -1)
+        if age_days >= 0 and features.get("domain_age", 0) == 0:
+            features["domain_age"]                = age_days
+            features["domain_registration_length"] = age_days
+        rank = ipqs.get("domain_rank", 0)
+        if rank > 0:
+            features["web_traffic"] = rank
+            features["page_rank"]   = max(0, 10 - int(rank / 100000))  # rough proxy
+        if ipqs.get("dns_valid"):
+            features["google_index"] = 1
+    return features
+
+
+def predict(url: str, fetchserp: dict = None, ipqs: dict = None) -> dict:
+    models = _load()
 
     features = extract_url_features(url)
-    row      = np.array([[features.get(f, 0) for f in feature_cols]])
-    proba    = model.predict_proba(row)[0]
-    pred_idx = int(np.argmax(proba))
-    label    = le.inverse_transform([pred_idx])[0]
-    confidence = round(float(proba[pred_idx]) * 100, 2)
+    if fetchserp or ipqs:
+        features = enrich_features(features, fetchserp, ipqs)
+
+    all_proba = []
+    for bundle in models:
+        feature_cols = bundle["features"]
+        model        = bundle["model"]
+        row = pd.DataFrame([[features.get(f, 0) for f in feature_cols]], columns=feature_cols)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            proba = model.predict_proba(row)[0]
+        all_proba.append((bundle["label_encoder"], proba))
+
+    # Pool: average probabilities across all loaded models
+    # All models must share the same label encoding (phishing / legitimate)
+    le_ref   = all_proba[0][0]
+    avg_prob = np.mean([p for _, p in all_proba], axis=0)
+
+    pred_idx   = int(np.argmax(avg_prob))
+    label      = le_ref.inverse_transform([pred_idx])[0]
+    confidence = round(float(avg_prob[pred_idx]) * 100, 2)
 
     return {
-        "url": url,
-        "label": label,
-        "confidence": confidence,
-        "probabilities": dict(zip(le.classes_, proba.tolist())),
+        "url":           url,
+        "label":         label,
+        "confidence":    confidence,
+        "probabilities": dict(zip(le_ref.classes_, avg_prob.tolist())),
+        "models_used":   len(models),
     }

@@ -62,31 +62,35 @@ async def _analyze(url: str) -> dict:
     if not _is_safe_url(url):
         raise HTTPException(status_code=400, detail="URL targets a private/reserved address (SSRF blocked)")
 
-    try:
-        ml_result = predict(url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ML prediction failed: {e}")
-
-    # Run all external API calls + HTML scrape in parallel
-    html_features, (vt_result, abuse_result, ipstack_result) = await asyncio.gather(
+    # Run all external API calls + HTML scrape in parallel first
+    html_features, (vt_result, abuse_result, ipstack_result, fetchserp_result, ipqs_result) = await asyncio.gather(
         asyncio.to_thread(scrape, url),
         check_all(url),
     )
 
-    final = decide(ml_result, vt_result, abuse_result, html_features, ipstack_result)
+    # Predict with enriched domain features from FetchSERP and IPQS
+    try:
+        ml_result = await asyncio.to_thread(predict, url, fetchserp_result, ipqs_result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ML prediction failed: {e}")
+
+    final = decide(ml_result, vt_result, abuse_result, html_features,
+                   ipstack_result, ipqs_result, fetchserp_result)
 
     result = {
-        "url":           url,
-        "score":         final["score"],
-        "label":         final["label"],
-        "reasons":       final["reasons"],
-        "source_scores": final["source_scores"],
-        "ml":            ml_result,
-        "virustotal":    vt_result,
-        "abuseipdb":     abuse_result,
-        "ipstack":       ipstack_result,
-        "html_features": html_features,
-        "cached":        False,
+        "url":            url,
+        "score":          final["score"],
+        "label":          final["label"],
+        "reasons":        final["reasons"],
+        "source_scores":  final["source_scores"],
+        "ml":             ml_result,
+        "virustotal":     vt_result,
+        "abuseipdb":      abuse_result,
+        "ipstack":        ipstack_result,
+        "fetchserp":      fetchserp_result,
+        "ipqualityscore": ipqs_result,
+        "html_features":  html_features,
+        "cached":         False,
     }
     _set_cache(url, result)
     return result

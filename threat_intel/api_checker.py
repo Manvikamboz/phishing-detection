@@ -1,4 +1,5 @@
 import os
+import asyncio
 import socket
 import ipaddress
 import httpx
@@ -7,9 +8,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_API_KEY")
-ABUSEIPDB_KEY  = os.getenv("ABUSEIPDB_API_KEY")
-IPSTACK_KEY    = os.getenv("IPSTACK_API_KEY")
+VIRUSTOTAL_KEY  = os.getenv("VIRUSTOTAL_API_KEY")
+ABUSEIPDB_KEY   = os.getenv("ABUSEIPDB_API_KEY")
+IPSTACK_KEY     = os.getenv("IPSTACK_API_KEY")
+FETCHSERP_KEY   = os.getenv("FETCHSERP_API_KEY")
+IPQS_KEY        = os.getenv("IPQUALITYSCORE_API_KEY")
 
 _BLOCKED_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 _BLOCKED_PREFIXES = ("192.168.", "10.", "172.16.", "169.254.")
@@ -157,7 +160,6 @@ async def _check_ipstack(url: str) -> dict:
 
 
 # Public sync wrappers (kept for backward compat with non-async callers)
-import asyncio
 
 
 def _run(coro):
@@ -185,11 +187,88 @@ def check_ipstack(url: str) -> dict:
     return _run(_check_ipstack(url))
 
 
+async def _check_fetchserp(url: str) -> dict:
+    """Fetch domain age, google index status, and page rank via FetchSERP."""
+    empty = {"domain_age_days": -1, "google_index": 0, "page_rank": 0, "error": None}
+    if not FETCHSERP_KEY:
+        return {**empty, "error": "FETCHSERP_API_KEY not set"}
+    try:
+        from urllib.parse import urlparse
+        hostname = urlparse(url).hostname or ""
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.fetchserp.com/v1/domain_info",
+                params={"domain": hostname, "api_key": FETCHSERP_KEY},
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "domain_age_days":  data.get("domain_age_days", -1),
+            "google_index":     int(data.get("google_indexed", False)),
+            "page_rank":        data.get("page_rank", 0),
+            "error":            None,
+        }
+    except httpx.HTTPStatusError as e:
+        return {**empty, "error": f"HTTP {e.response.status_code}"}
+    except Exception as e:
+        return {**empty, "error": str(e)}
+
+
+async def _check_ipqualityscore(url: str) -> dict:
+    """Check URL fraud score, proxy/VPN/bot signals via IPQualityScore."""
+    empty = {"fraud_score": 0, "is_proxy": False, "is_vpn": False,
+             "is_bot": False, "phishing": False, "malware": False,
+             "suspicious": False, "risk_score": 0, "error": None}
+    if not IPQS_KEY:
+        return {**empty, "error": "IPQUALITYSCORE_API_KEY not set"}
+    try:
+        import urllib.parse
+        encoded = urllib.parse.quote(url, safe="")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"https://www.ipqualityscore.com/api/json/url/{IPQS_KEY}/{encoded}"
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        age_days = -1
+        domain_age = data.get("domain_age", {})
+        if isinstance(domain_age, dict) and domain_age.get("timestamp"):
+            import time
+            age_days = int((time.time() - domain_age["timestamp"]) / 86400)
+        return {
+            "fraud_score":    data.get("risk_score", 0),
+            "is_proxy":       data.get("proxy", False),
+            "is_vpn":         data.get("vpn", False),
+            "is_bot":         data.get("bot_status", False),
+            "phishing":       data.get("phishing", False),
+            "malware":        data.get("malware", False),
+            "suspicious":     data.get("suspicious", False),
+            "risk_score":     data.get("risk_score", 0),
+            "domain_rank":    data.get("domain_rank", 0),
+            "dns_valid":      data.get("dns_valid", True),
+            "domain_age_days": age_days,
+            "error":          None,
+        }
+    except httpx.HTTPStatusError as e:
+        return {**empty, "error": f"HTTP {e.response.status_code}"}
+    except Exception as e:
+        return {**empty, "error": str(e)}
+
+
+def check_fetchserp(url: str) -> dict:
+    return _run(_check_fetchserp(url))
+
+
+def check_ipqualityscore(url: str) -> dict:
+    return _run(_check_ipqualityscore(url))
+
+
 async def check_all(url: str) -> tuple:
-    """Run all three API checks concurrently."""
-    import asyncio
+    """Run all API checks concurrently — returns (vt, abuse, ipstack, fetchserp, ipqs)."""
     return await asyncio.gather(
         _check_virustotal(url),
         _check_abuseipdb(url),
         _check_ipstack(url),
+        _check_fetchserp(url),
+        _check_ipqualityscore(url),
     )
