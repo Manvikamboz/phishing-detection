@@ -4,14 +4,17 @@ import numpy as np
 import pandas as pd
 import re
 import math
+import os
 import socket
 import requests
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
+_BASE = os.path.dirname(os.path.abspath(__file__))
+
 MODEL_PATHS = [
-    "ml_model/phishing_model.pkl",    # trained on dataset 1 (Kaggle web-page phishing)
-    "ml_model/phishing_model_2.pkl",  # trained on dataset 2 (second Kaggle dataset)
+    os.path.join(_BASE, "phishing_model.pkl"),
+    os.path.join(_BASE, "phishing_model_2.pkl"),
 ]
 _cache = {}
 
@@ -317,7 +320,10 @@ def enrich_features(features: dict, fetchserp: dict = None, ipqs: dict = None) -
 
 
 def predict(url: str, fetchserp: dict = None, ipqs: dict = None) -> dict:
-    models = _load()
+    try:
+        models = _load()
+    except FileNotFoundError as e:
+        raise RuntimeError(str(e))
 
     features = extract_url_features(url)
     if fetchserp or ipqs:

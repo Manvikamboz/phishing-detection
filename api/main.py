@@ -62,17 +62,17 @@ async def _analyze(url: str) -> dict:
     if not _is_safe_url(url):
         raise HTTPException(status_code=400, detail="URL targets a private/reserved address (SSRF blocked)")
 
-    # Run all external API calls + HTML scrape in parallel first
-    html_features, (vt_result, abuse_result, ipstack_result, fetchserp_result, ipqs_result) = await asyncio.gather(
-        asyncio.to_thread(scrape, url),
-        check_all(url),
-    )
-
-    # Predict with enriched domain features from FetchSERP and IPQS
     try:
-        ml_result = await asyncio.to_thread(predict, url, fetchserp_result, ipqs_result)
+        async with asyncio.timeout(120):
+            html_features, (vt_result, abuse_result, ipstack_result, fetchserp_result, ipqs_result) = await asyncio.gather(
+                asyncio.to_thread(scrape, url),
+                check_all(url),
+            )
+            ml_result = await asyncio.to_thread(predict, url, fetchserp_result, ipqs_result)
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="Analysis timed out after 120 seconds")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ML prediction failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
     final = decide(ml_result, vt_result, abuse_result, html_features,
                    ipstack_result, ipqs_result, fetchserp_result)

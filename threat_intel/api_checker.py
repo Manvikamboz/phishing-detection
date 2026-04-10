@@ -52,7 +52,7 @@ def _resolve_ip(url: str) -> str:
 async def _check_virustotal(url: str) -> dict:
     try:
         headers = {"x-apikey": VIRUSTOTAL_KEY}
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=90) as client:
             # Step 1: submit URL
             resp = await client.post(
                 "https://www.virustotal.com/api/v3/urls",
@@ -60,8 +60,9 @@ async def _check_virustotal(url: str) -> dict:
             )
             analysis_id = resp.json()["data"]["id"]
 
-            # Step 2: poll until status is completed (max 6 attempts x 3s)
-            for _ in range(6):
+            # Step 2: poll until status is completed (max 15 attempts x 4s = 60s)
+            rjson = {}
+            for _ in range(15):
                 result = await client.get(
                     f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
                     headers=headers
@@ -70,9 +71,9 @@ async def _check_virustotal(url: str) -> dict:
                 status = rjson.get("data", {}).get("attributes", {}).get("status", "")
                 if status == "completed":
                     break
-                await asyncio.sleep(3)
+                await asyncio.sleep(4)
 
-        stats = rjson["data"]["attributes"]["stats"]
+            stats = rjson.get("data", {}).get("attributes", {}).get("stats", {})
         return {
             "malicious":  stats.get("malicious", 0),
             "suspicious": stats.get("suspicious", 0),
@@ -159,33 +160,6 @@ async def _check_ipstack(url: str) -> dict:
         return {"ip": "", "country": "", "is_tor": False, "is_proxy": False, "is_anonymous": False, "is_attacker": False, "error": str(e)}
 
 
-# Public sync wrappers (kept for backward compat with non-async callers)
-
-
-def _run(coro):
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        return loop.run_until_complete(coro)
-    except Exception:
-        return asyncio.run(coro)
-
-
-def check_virustotal(url: str) -> dict:
-    return _run(_check_virustotal(url))
-
-
-def check_abuseipdb(url: str) -> dict:
-    return _run(_check_abuseipdb(url))
-
-
-def check_ipstack(url: str) -> dict:
-    return _run(_check_ipstack(url))
-
 
 async def _check_fetchserp(url: str) -> dict:
     """Fetch domain age, google index status, and page rank via FetchSERP."""
@@ -254,13 +228,6 @@ async def _check_ipqualityscore(url: str) -> dict:
     except Exception as e:
         return {**empty, "error": str(e)}
 
-
-def check_fetchserp(url: str) -> dict:
-    return _run(_check_fetchserp(url))
-
-
-def check_ipqualityscore(url: str) -> dict:
-    return _run(_check_ipqualityscore(url))
 
 
 async def check_all(url: str) -> tuple:

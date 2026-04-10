@@ -45,7 +45,7 @@ if st.button("Analyze", use_container_width=True):
         with st.spinner("Analyzing URL"):
             try:
                 t0 = time.time()
-                resp = requests.post(f"{API_URL}/predict", json={"url": url_input.strip()}, timeout=120)
+                resp = requests.post(f"{API_URL}/predict", json={"url": url_input.strip()}, timeout=180)
                 resp.raise_for_status()
                 data = resp.json()
                 elapsed = round(time.time() - t0, 2)
