@@ -37,17 +37,22 @@ def _lr_to_log(lr: float) -> float:
 # ── Source evidence extractors ────────────────────────────────────────────────
 
 def _evidence_ml(ml: dict) -> tuple[float, list[str], bool]:
-    """Returns (log_odds_contribution, reasons, hard_override)."""
+    """Returns (log_odds_contribution, reasons, hard_override).
+    ML model can be biased when HTML scraping fails (private IPs, firewalls)
+    causing features like nb_hyperlinks/google_index to default to 0.
+    Hard override requires VT confirmation to avoid false positives.
+    """
     label = ml.get("label", "")
     conf  = ml.get("confidence", 0)
     if label == "phishing":
         if conf >= 90:
-            return _lr_to_log(18.0), [f"ML model: HIGH confidence phishing ({conf:.1f}%)"], True
+            # High confidence but NO hard override alone — needs VT to confirm
+            return _lr_to_log(8.0), [f"ML model: HIGH confidence phishing ({conf:.1f}%)"], False
         if conf >= 70:
-            return _lr_to_log(9.0),  [f"ML model flagged as phishing ({conf:.1f}%)"], False
-        return _lr_to_log(4.0),      [f"ML model flagged as phishing ({conf:.1f}%)"], False
+            return _lr_to_log(5.0),  [f"ML model flagged as phishing ({conf:.1f}%)"], False
+        return _lr_to_log(2.5),      [f"ML model flagged as phishing ({conf:.1f}%)"], False
     if label == "legitimate" and conf < 60:
-        return _lr_to_log(1.8),      [f"ML model uncertain ({conf:.1f}% legitimate confidence)"], False
+        return _lr_to_log(1.5),      [f"ML model uncertain ({conf:.1f}% legitimate confidence)"], False
     # Strong legitimate signal — negative contribution
     return _lr_to_log(0.15),         [], False
 
@@ -126,51 +131,51 @@ def _evidence_html(html: dict) -> tuple[float, list[str]]:
     return log_odds, reasons
 
 
-def _evidence_ipqs(ipqs: dict) -> tuple[float, list[str]]:
-    if not ipqs or ipqs.get("error"):
+def _evidence_whoisfreaks(wf: dict) -> tuple[float, list[str]]:
+    """Domain age and registration freshness from WhoisFreaks."""
+    if not wf or wf.get("error"):
         return 0.0, []
     log_odds, reasons = 0.0, []
-    score = ipqs.get("fraud_score", 0)
-    if ipqs.get("phishing"):
-        log_odds += _lr_to_log(20.0)
-        reasons.append(f"IPQualityScore: URL flagged as phishing (fraud score {score})")
-    elif ipqs.get("malware"):
-        log_odds += _lr_to_log(15.0)
-        reasons.append(f"IPQualityScore: URL flagged as malware (fraud score {score})")
-    elif ipqs.get("suspicious") or score >= 75:
-        log_odds += _lr_to_log(6.0)
-        reasons.append(f"IPQualityScore: suspicious URL (fraud score {score})")
-    elif score >= 50:
-        log_odds += _lr_to_log(3.0)
-        reasons.append(f"IPQualityScore: moderate risk (fraud score {score})")
-    elif score < 20:
-        log_odds += _lr_to_log(0.2)  # clean signal
-    if ipqs.get("is_proxy") or ipqs.get("is_vpn"):
-        log_odds += _lr_to_log(2.5)
-        reasons.append("IPQualityScore: traffic routed through proxy/VPN")
-    return log_odds, reasons
-
-
-def _evidence_fetchserp(fs: dict) -> tuple[float, list[str]]:
-    """Domain age and google index as legitimacy signals."""
-    if not fs or fs.get("error"):
-        return 0.0, []
-    log_odds, reasons = 0.0, []
-    age_days = fs.get("domain_age_days", -1)
+    age_days = wf.get("domain_age_days", -1)
     if age_days >= 0:
         if age_days < 30:
             log_odds += _lr_to_log(6.0)
-            reasons.append(f"Domain is very new ({age_days} days old) — high phishing risk")
+            reasons.append(f"WhoisFreaks: domain is very new ({age_days} days old)")
         elif age_days < 180:
-            log_odds += _lr_to_log(2.5)
-            reasons.append(f"Domain is relatively new ({age_days} days old)")
+            log_odds += _lr_to_log(2.2)
+            reasons.append(f"WhoisFreaks: domain is relatively new ({age_days} days old)")
+        elif age_days > 365:
+            log_odds += _lr_to_log(0.35)
+    if wf.get("registered") is False:
+        log_odds += _lr_to_log(4.0)
+        reasons.append("WhoisFreaks: WHOIS record missing or domain not registered")
+    if wf.get("nameserver_count", 0) <= 1 and age_days >= 0 and age_days < 30:
+        log_odds += _lr_to_log(1.4)
+        reasons.append("WhoisFreaks: very new domain with minimal nameserver footprint")
+    return log_odds, reasons
+
+
+def _evidence_whoisxml(wx: dict) -> tuple[float, list[str]]:
+    """WHOIS corroboration via WhoisXML."""
+    if not wx or wx.get("error"):
+        return 0.0, []
+    log_odds, reasons = 0.0, []
+    age_days = wx.get("domain_age_days", -1)
+    if age_days >= 0:
+        if age_days < 30:
+            log_odds += _lr_to_log(5.0)
+            reasons.append(f"WhoisXML: domain is very new ({age_days} days old)")
+        elif age_days < 180:
+            log_odds += _lr_to_log(2.0)
+            reasons.append(f"WhoisXML: domain is relatively new ({age_days} days old)")
         else:
-            log_odds += _lr_to_log(0.2)  # old domain = legitimate signal
-    if fs.get("google_index") == 0 and age_days >= 0:
-        log_odds += _lr_to_log(2.0)
-        reasons.append("Domain not indexed by Google")
-    elif fs.get("google_index") == 1:
-        log_odds += _lr_to_log(0.3)  # indexed = legitimate signal
+            log_odds += _lr_to_log(0.35)
+    if wx.get("registered") is False:
+        log_odds += _lr_to_log(4.0)
+        reasons.append("WhoisXML: no active WHOIS registration found")
+    if wx.get("privacy_protected") and age_days >= 0 and age_days < 180:
+        log_odds += _lr_to_log(1.3)
+        reasons.append("WhoisXML: young domain uses privacy/redaction in WHOIS")
     return log_odds, reasons
 
 
@@ -259,7 +264,7 @@ def _evidence_url(url: str) -> tuple[float, list[str]]:
 
 def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
            html_features: dict, ipstack_result: dict = None,
-           ipqs_result: dict = None, fetchserp_result: dict = None) -> dict:
+           whoisfreaks_result: dict = None, whoisxml_result: dict = None) -> dict:
 
     url = ml_result.get("url", "")
     trusted = _is_trusted(url)
@@ -270,16 +275,16 @@ def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
     ip_log,    ip_reasons            = _evidence_ipstack(ipstack_result or {})
     html_log,  html_reasons          = _evidence_html(html_features)
     url_log,   url_reasons           = _evidence_url(url)
-    ipqs_log,  ipqs_reasons          = _evidence_ipqs(ipqs_result or {})
-    fs_log,    fs_reasons            = _evidence_fetchserp(fetchserp_result or {})
+    wf_log,    wf_reasons            = _evidence_whoisfreaks(whoisfreaks_result or {})
+    wx_log,    wx_reasons            = _evidence_whoisxml(whoisxml_result or {})
 
     if trusted:
         ml_log   = min(ml_log, _lr_to_log(1.0))
         html_log = min(html_log, _lr_to_log(1.0))
         ml_hard  = False
 
-    weights = {"ml": 1.4, "vt": 1.3, "abuse": 0.9, "ip": 0.8,
-               "html": 0.9, "url": 1.1, "ipqs": 1.4, "fetchserp": 1.2}
+    weights = {"ml": 0.9, "vt": 1.5, "abuse": 0.9, "ip": 0.8,
+               "html": 0.9, "url": 1.1, "whoisfreaks": 1.0, "whoisxml": 0.9}
     total_log_odds = (
         _LOG_PRIOR
         + weights["ml"]       * ml_log
@@ -288,8 +293,8 @@ def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
         + weights["ip"]       * ip_log
         + weights["html"]     * html_log
         + weights["url"]      * url_log
-        + weights["ipqs"]     * ipqs_log
-        + weights["fetchserp"]* fs_log
+        + weights["whoisfreaks"] * wf_log
+        + weights["whoisxml"]    * wx_log
     )
 
     # Convert posterior probability → 0-100 score
@@ -297,15 +302,13 @@ def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
     score = int(round(posterior * 100))
 
     all_reasons = (ml_reasons + vt_reasons + abuse_reasons + ip_reasons
-                   + html_reasons + url_reasons + ipqs_reasons + fs_reasons)
+                   + html_reasons + url_reasons + wf_reasons + wx_reasons)
 
     # ── Hard override rules (skipped for trusted domains) ──────────────────
     override_reason = None
     if not trusted:
-        if ml_hard and vt_hard:
+        if vt_hard and ml_hard:
             override_reason = "OVERRIDE: Both ML model and VirusTotal independently confirmed phishing"
-        elif ml_hard and url_log > _lr_to_log(5.0):
-            override_reason = "OVERRIDE: ML high-confidence phishing + strong URL heuristic signals"
         elif vt_hard and url_log > _lr_to_log(5.0):
             override_reason = "OVERRIDE: VirusTotal confirmed malicious + strong URL heuristic signals"
         elif vt_log > _lr_to_log(8.0) and abuse_log > _lr_to_log(3.0):
@@ -340,7 +343,7 @@ def decide(ml_result: dict, vt_result: dict, abuse_result: dict,
             "IPStack":          _log_to_display(ip_log * weights["ip"]),
             "HTML Analysis":    _log_to_display(html_log * weights["html"]),
             "URL Heuristics":   _log_to_display(url_log * weights["url"]),
-            "IPQualityScore":   _log_to_display(ipqs_log * weights["ipqs"]),
-            "FetchSERP":        _log_to_display(fs_log * weights["fetchserp"]),
+            "WhoisFreaks":      _log_to_display(wf_log * weights["whoisfreaks"]),
+            "WhoisXML":         _log_to_display(wx_log * weights["whoisxml"]),
         },
     }

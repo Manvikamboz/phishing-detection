@@ -64,18 +64,18 @@ async def _analyze(url: str) -> dict:
 
     try:
         async with asyncio.timeout(120):
-            html_features, (vt_result, abuse_result, ipstack_result, fetchserp_result, ipqs_result) = await asyncio.gather(
+            html_features, (vt_result, abuse_result, ipstack_result, whoisfreaks_result, whoisxml_result) = await asyncio.gather(
                 asyncio.to_thread(scrape, url),
                 check_all(url),
             )
-            ml_result = await asyncio.to_thread(predict, url, fetchserp_result, ipqs_result)
+            ml_result = await asyncio.to_thread(predict, url, whoisfreaks_result, whoisxml_result)
     except TimeoutError:
         raise HTTPException(status_code=504, detail="Analysis timed out after 120 seconds")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
     final = decide(ml_result, vt_result, abuse_result, html_features,
-                   ipstack_result, ipqs_result, fetchserp_result)
+                   ipstack_result, whoisfreaks_result, whoisxml_result)
 
     result = {
         "url":            url,
@@ -87,8 +87,8 @@ async def _analyze(url: str) -> dict:
         "virustotal":     vt_result,
         "abuseipdb":      abuse_result,
         "ipstack":        ipstack_result,
-        "fetchserp":      fetchserp_result,
-        "ipqualityscore": ipqs_result,
+        "whoisfreaks":    whoisfreaks_result,
+        "whoisxml":       whoisxml_result,
         "html_features":  html_features,
         "cached":         False,
     }

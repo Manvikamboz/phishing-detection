@@ -68,7 +68,7 @@ if st.button("Analyze", use_container_width=True):
             models_used = data.get("ml", {}).get("models_used", 1)
             st.metric("Models Used", models_used)
 
-        st.progress(score / 100)
+        st.progress(max(score, 1) / 100)
 
         # ── Gauge ─────────────────────────────────────────────────────────────
         gauge_color = "red" if label == "phishing" else "orange" if label == "suspicious" else "green"
@@ -95,34 +95,79 @@ if st.button("Analyze", use_container_width=True):
         if source_scores:
             st.subheader("📊 Detection Source Breakdown")
 
-            # A source score > 50 means it contributed toward phishing
-            # A source score < 50 means it contributed toward legitimate
-            src_colors = []
-            src_labels_annotated = []
+            # Map source name to its raw API result to detect errors/missing keys
+            _src_data_map = {
+                "ML Model":       data.get("ml", {}),
+                "VirusTotal":     data.get("virustotal", {}),
+                "AbuseIPDB":      data.get("abuseipdb", {}),
+                "IPStack":        data.get("ipstack", {}),
+                "HTML Analysis":  data.get("html_features", {}),
+                "URL Heuristics": {},
+                "WhoisFreaks":    data.get("whoisfreaks", {}),
+                "WhoisXML":       data.get("whoisxml", {}),
+            }
+
+            def _src_unavailable(src):
+                d = _src_data_map.get(src, {})
+                return bool(d.get("error"))
+
+            src_colors, src_labels_annotated, src_values, src_texts, src_hover = [], [], [], [], []
             for src, val in source_scores.items():
-                if val >= 65:
+                if _src_unavailable(src):
+                    src_colors.append("lightgray")
+                    src_labels_annotated.append(f"{src} ➖")
+                    src_values.append(0)
+                    src_texts.append("N/A")
+                    src_hover.append("Unavailable")
+                elif val >= 65:
                     src_colors.append("red")
                     src_labels_annotated.append(f"{src} ⚠️")
+                    src_values.append(val)
+                    if src == "AbuseIPDB":
+                        raw_score = data.get("abuseipdb", {}).get("abuse_score", 0)
+                        src_texts.append(f"{val} ({raw_score}%)")
+                        src_hover.append(f"Contribution: {val}<br>Raw AbuseIPDB score: {raw_score}%")
+                    else:
+                        src_texts.append(str(val))
+                        src_hover.append(f"Contribution: {val}")
                 elif val >= 45:
                     src_colors.append("orange")
                     src_labels_annotated.append(f"{src} ⚡")
+                    src_values.append(val)
+                    if src == "AbuseIPDB":
+                        raw_score = data.get("abuseipdb", {}).get("abuse_score", 0)
+                        src_texts.append(f"{val} ({raw_score}%)")
+                        src_hover.append(f"Contribution: {val}<br>Raw AbuseIPDB score: {raw_score}%")
+                    else:
+                        src_texts.append(str(val))
+                        src_hover.append(f"Contribution: {val}")
                 else:
                     src_colors.append("green")
                     src_labels_annotated.append(f"{src} ✅")
+                    src_values.append(val)
+                    if src == "AbuseIPDB":
+                        raw_score = data.get("abuseipdb", {}).get("abuse_score", 0)
+                        src_texts.append(f"{val} ({raw_score}%)")
+                        src_hover.append(f"Contribution: {val}<br>Raw AbuseIPDB score: {raw_score}%")
+                    else:
+                        src_texts.append(str(val))
+                        src_hover.append(f"Contribution: {val}")
 
             src_fig = go.Figure(go.Bar(
                 x=src_labels_annotated,
-                y=list(source_scores.values()),
+                y=src_values,
                 marker_color=src_colors,
-                text=[f"{v}" for v in source_scores.values()],
+                text=src_texts,
                 textposition="outside",
+                customdata=src_hover,
+                hovertemplate="%{x}<br>%{customdata}<extra></extra>",
             ))
             src_fig.add_hline(y=65, line_dash="dash", line_color="red",
                               annotation_text="Phishing threshold (65)", annotation_position="top left")
             src_fig.add_hline(y=35, line_dash="dash", line_color="green",
                               annotation_text="Benign threshold (35)", annotation_position="bottom left")
             src_fig.update_layout(
-                title="Each source's contribution",
+                title="Each source's contribution (AbuseIPDB text includes raw %; gray = API unavailable/key missing)",
                 yaxis=dict(range=[0, 110], title="Threat Score (0=clean, 100=threat)"),
                 xaxis_title="Detection Source",
                 height=380, margin=dict(t=60, b=0),
@@ -153,7 +198,7 @@ if st.button("Analyze", use_container_width=True):
         if label == "benign":
             st.success(
                 f"**Score {score}/100 → BENIGN.** "
-                "All detection sources (ML model, VirusTotal, URL heuristics, IPQualityScore) "
+                "All detection sources (ML model, VirusTotal, URL heuristics, WHOIS intelligence) "
                 "returned clean or low-risk signals. The domain appears legitimate."
             )
         elif label == "suspicious":
@@ -204,8 +249,8 @@ if st.button("Analyze", use_container_width=True):
                     f"ℹ️ The ML model predicted **{ml_label}** ({ml.get('confidence',0):.1f}% confidence) "
                     f"but the final verdict is **BENIGN**. "
                     "This is because the ML model's prediction was overridden by strong clean signals "
-                    "from VirusTotal, IPQualityScore, and/or the trusted domain list. "
-                    "The ML model alone can be biased when domain age / page rank features are unavailable."
+                    "from VirusTotal, WHOIS intelligence, and/or the trusted domain list. "
+                    "The ML model alone can be biased when domain-age enrichment is unavailable."
                 )
             elif ml_label == label:
                 st.success(f"✅ ML model agrees with the final verdict: **{label.upper()}**")
@@ -278,23 +323,22 @@ if st.button("Analyze", use_container_width=True):
                 abuse_fig.update_layout(height=220, margin=dict(t=40, b=0, l=20, r=20))
                 st.plotly_chart(abuse_fig, use_container_width=True)
 
-        # ── IPQualityScore ────────────────────────────────────────────────────
-        with st.expander("🛡️ IPQualityScore Report"):
-            ipqs = data.get("ipqualityscore", {})
-            if not ipqs or ipqs.get("error"):
-                st.warning(f"IPQualityScore: {ipqs.get('error', 'No data') if ipqs else 'No data returned'}")
+        # ── WhoisFreaks ───────────────────────────────────────────────────────
+        with st.expander("🧾 WhoisFreaks Domain Intelligence"):
+            wf = data.get("whoisfreaks", {})
+            if not wf or wf.get("error"):
+                st.warning(f"WhoisFreaks: {wf.get('error', 'No data') if wf else 'No data returned'}")
             else:
                 qc1, qc2, qc3 = st.columns(3)
-                qc1.metric("Fraud Score",   ipqs.get("fraud_score", 0))
-                qc2.metric("Domain Rank",   ipqs.get("domain_rank", "N/A"))
-                qc3.metric("Domain Age",    f"{ipqs.get('domain_age_days', -1)} days" if ipqs.get('domain_age_days', -1) >= 0 else "Unknown")
+                qc1.metric("Registered", "Yes ✅" if wf.get("registered") else "No ⚠️")
+                qc2.metric("Domain Age", f"{wf.get('domain_age_days', -1)} days" if wf.get('domain_age_days', -1) >= 0 else "Unknown")
+                qc3.metric("Registrar", wf.get("registrar") or "Unknown")
 
                 flags = {
-                    "Phishing":  ipqs.get("phishing", False),
-                    "Malware":   ipqs.get("malware", False),
-                    "Suspicious":ipqs.get("suspicious", False),
-                    "Proxy/VPN": ipqs.get("is_proxy", False) or ipqs.get("is_vpn", False),
-                    "Bot":       ipqs.get("is_bot", False),
+                    "WHOIS Found": wf.get("registered", False),
+                    "Privacy":     wf.get("privacy_protected", False),
+                    "Young (<30d)": 0 <= wf.get("domain_age_days", -1) < 30,
+                    "Few NS":      wf.get("nameserver_count", 0) <= 1,
                 }
                 flag_colors = ["red" if v else "green" for v in flags.values()]
                 flag_fig = go.Figure(go.Bar(
@@ -305,21 +349,19 @@ if st.button("Analyze", use_container_width=True):
                     textposition="outside",
                 ))
                 flag_fig.update_layout(
-                    title="IPQualityScore Threat Flags",
+                    title="WhoisFreaks Registration Signals",
                     yaxis=dict(range=[0, 1.5], showticklabels=False),
                     height=280, margin=dict(t=40, b=0), showlegend=False,
                 )
                 st.plotly_chart(flag_fig, use_container_width=True)
 
-                fraud = ipqs.get("fraud_score", 0)
-                if ipqs.get("phishing"):
-                    st.error("🚨 IPQualityScore confirmed this URL as a PHISHING site.")
-                elif ipqs.get("malware"):
-                    st.error("🚨 IPQualityScore confirmed MALWARE on this URL.")
-                elif fraud >= 75:
-                    st.warning(f"⚠️ High fraud score ({fraud}) — URL is suspicious.")
-                elif fraud < 20:
-                    st.success(f"✅ Low fraud score ({fraud}) — URL appears clean.")
+                age_days = wf.get("domain_age_days", -1)
+                if not wf.get("registered"):
+                    st.warning("⚠️ WhoisFreaks did not find an active WHOIS registration for this domain.")
+                elif 0 <= age_days < 30:
+                    st.warning(f"⚠️ The domain is very new ({age_days} days old), which is common in phishing campaigns.")
+                else:
+                    st.success("✅ WhoisFreaks returned a normal registration record for this domain.")
 
         # ── IPStack Geolocation ───────────────────────────────────────────────
         with st.expander("🌍 IPStack Geolocation & Threat"):
@@ -328,7 +370,7 @@ if st.button("Analyze", use_container_width=True):
                 st.warning(f"IPStack: {ip.get('error', 'No data') if ip else 'No data'}")
             else:
                 ic1, ic2, ic3 = st.columns(3)
-                ic1.metric("Country", ip.get("country_name", "N/A"))
+                ic1.metric("Country", ip.get("country") or ip.get("country_name", "N/A"))
                 ic2.metric("City",    ip.get("city", "N/A"))
                 ic3.metric("IP",      ip.get("ip", "N/A"))
 
@@ -369,7 +411,7 @@ if st.button("Analyze", use_container_width=True):
                             lonaxis=dict(range=[-180, 180]),
                             lataxis=dict(range=[-90, 90]),
                         ),
-                        title=f"IP Location — {ip.get('city')}, {ip.get('country_name')} {'🚨 THREAT' if any_threat else '✅ Clean'}",
+                        title=f"IP Location — {ip.get('city')}, {ip.get('country') or ip.get('country_name', '')} {'🚨 THREAT' if any_threat else '✅ Clean'}",
                         height=420, margin=dict(t=50, b=0, l=0, r=0),
                     )
                     st.plotly_chart(world_map, use_container_width=True)
@@ -417,15 +459,24 @@ if st.button("Analyze", use_container_width=True):
                 if not hf.get("has_login_form") and not hf.get("has_password_field") and hf.get("iframe_count", 0) <= 2:
                     st.success("✅ No suspicious HTML patterns detected.")
 
-        # ── FetchSERP ─────────────────────────────────────────────────────────
-        with st.expander("🔎 FetchSERP Domain Intelligence"):
-            fs = data.get("fetchserp", {})
-            if not fs or fs.get("error"):
-                st.info(f"FetchSERP: {fs.get('error', 'No data') if fs else 'No data — API key not configured yet.'}")
+        # ── WhoisXML ──────────────────────────────────────────────────────────
+        with st.expander("🌐 WhoisXML Domain Intelligence"):
+            wx = data.get("whoisxml", {})
+            if not wx or wx.get("error"):
+                st.info(f"WhoisXML: {wx.get('error', 'No data') if wx else 'No data — API key not configured yet.'}")
             else:
                 fc1, fc2, fc3 = st.columns(3)
-                fc1.metric("Domain Age",    f"{fs.get('domain_age_days', 'N/A')} days")
-                fc2.metric("Google Indexed", "Yes ✅" if fs.get("google_index") else "No ⚠️")
-                fc3.metric("Page Rank",      fs.get("page_rank", "N/A"))
+                fc1.metric("Domain Age", f"{wx.get('domain_age_days', 'N/A')} days" if wx.get("domain_age_days", -1) >= 0 else "Unknown")
+                fc2.metric("Registered", "Yes ✅" if wx.get("registered") else "No ⚠️")
+                fc3.metric("Registrar", wx.get("registrar") or "Unknown")
 
+                wc1, wc2, wc3 = st.columns(3)
+                wc1.metric("Registrant Country", wx.get("registrant_country") or "Unknown")
+                wc2.metric("Privacy", "Yes ⚠️" if wx.get("privacy_protected") else "No ✅")
+                wc3.metric("Name Servers", wx.get("nameserver_count", 0))
 
+                if wx.get("created_date") or wx.get("expires_date"):
+                    st.caption(
+                        f"Created: {wx.get('created_date') or 'Unknown'} | "
+                        f"Expires: {wx.get('expires_date') or 'Unknown'}"
+                    )

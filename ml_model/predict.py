@@ -15,6 +15,7 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATHS = [
     os.path.join(_BASE, "phishing_model.pkl"),
     os.path.join(_BASE, "phishing_model_2.pkl"),
+    os.path.join(_BASE, "phishing_model_combined.pkl"),
 ]
 _cache = {}
 
@@ -39,7 +40,9 @@ def _load():
             except FileNotFoundError:
                 pass  # second model optional — only use if trained
         if not loaded:
-            raise FileNotFoundError("No trained model found. Run ml_model/train.py first.")
+            raise FileNotFoundError(
+                "No trained model found. Train the models with ml_model/phishing_train_colab.ipynb and place the .pkl files in ml_model/."
+            )
         _cache["models"] = loaded
     return _cache["models"]
 
@@ -95,6 +98,9 @@ def _add_engineered_features(features: dict) -> dict:
         + features.get("http_in_path", 0)
         + features.get("https_token", 0)
     )
+    features["digit_ratio_host"]  = features.get("ratio_digits_host", 0)
+    features["query_param_count"] = features.get("nb_eq", 0)
+    features["hint_density"]      = features.get("phish_hints", 0) / max(length_url / 10, 1)
     return features
 
 
@@ -281,7 +287,7 @@ def extract_url_features(url: str) -> dict:
         "domain_in_title": domain_in_title,
         "domain_with_copyright": domain_with_copyright,
         "whois_registered_domain": dns_record,
-        "domain_registration_length": 0,  # filled by enrich_features() if FetchSERP key set
+        "domain_registration_length": 0,  # filled by enrich_features() if WHOIS data is available
         "domain_age": 0,
         "web_traffic": 0,
         "dns_record": dns_record,
@@ -296,38 +302,34 @@ def extract_url_features(url: str) -> dict:
     return _add_engineered_features(features)
 
 
-def enrich_features(features: dict, fetchserp: dict = None, ipqs: dict = None) -> dict:
-    """Overwrite the hardcoded-zero domain features with real API values."""
-    if fetchserp and not fetchserp.get("error"):
-        age_days = fetchserp.get("domain_age_days", -1)
+def enrich_features(features: dict, whoisfreaks: dict = None, whoisxml: dict = None) -> dict:
+    """Overwrite the hardcoded-zero domain features with WHOIS-derived values."""
+    if whoisfreaks and not whoisfreaks.get("error"):
+        age_days = whoisfreaks.get("domain_age_days", -1)
         if age_days >= 0:
             features["domain_age"]                = age_days
             features["domain_registration_length"] = age_days
-        features["google_index"] = fetchserp.get("google_index", 0)
-        features["page_rank"]    = fetchserp.get("page_rank", 0)
-    if ipqs and not ipqs.get("error"):
-        age_days = ipqs.get("domain_age_days", -1)
+        if whoisfreaks.get("registered"):
+            features["whois_registered_domain"] = 1
+    if whoisxml and not whoisxml.get("error"):
+        age_days = whoisxml.get("domain_age_days", -1)
         if age_days >= 0 and features.get("domain_age", 0) == 0:
             features["domain_age"]                = age_days
             features["domain_registration_length"] = age_days
-        rank = ipqs.get("domain_rank", 0)
-        if rank > 0:
-            features["web_traffic"] = rank
-            features["page_rank"]   = max(0, 10 - int(rank / 100000))  # rough proxy
-        if ipqs.get("dns_valid"):
-            features["google_index"] = 1
+        if whoisxml.get("registered"):
+            features["whois_registered_domain"] = 1
     return features
 
 
-def predict(url: str, fetchserp: dict = None, ipqs: dict = None) -> dict:
+def predict(url: str, whoisfreaks: dict = None, whoisxml: dict = None) -> dict:
     try:
         models = _load()
     except FileNotFoundError as e:
         raise RuntimeError(str(e))
 
     features = extract_url_features(url)
-    if fetchserp or ipqs:
-        features = enrich_features(features, fetchserp, ipqs)
+    if whoisfreaks or whoisxml:
+        features = enrich_features(features, whoisfreaks, whoisxml)
 
     all_proba = []
     for bundle in models:
